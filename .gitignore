@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.env
+
+# Project Specific
+data/
+results/
+outputs/
+data_outputs/
+.DS_Store
+
+# Docker
+.dockerignore
