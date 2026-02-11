@@ -43,4 +43,4 @@ The script will automatically:
 
 ## Future Work (Semester 2)
 - Сontext-aware forecasting framework capable of handling "Drift" (sudden changes in consumer behavior).
-- Ensemble self-correction: automatic re-clustering and model retraining when drift is detected.
+- Ensemble self-correction: automatic re-clustering and model retraining when drift is detected.s

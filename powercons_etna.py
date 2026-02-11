@@ -732,7 +732,8 @@ def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
         'global': {},
         'ensemble': {},
         'global_errors': [],
-        'ensemble_errors': []
+        'ensemble_errors': [],
+        'per_meter': {} # To store {meter_num: {'global_mae': ..., 'ensemble_mae': ...}}
     }
 
     # Global evaluation
@@ -741,6 +742,8 @@ def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
     global_mapes = []
     global_errors = []
     
+    per_meter_global = {}
+
     if global_forecasts:
         for segment_key, forecast in global_forecasts.items():
             try:
@@ -761,12 +764,13 @@ def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
                 
                 mae = mean_absolute_error(actual, forecast)
                 rmse = np.sqrt(mean_squared_error(actual, forecast))
-                # mape = mean_absolute_percentage_error(actual, forecast)
                 mape = np.mean(np.abs((actual - forecast) / (np.abs(actual) + 1e-8))) * 100
 
                 global_maes.append(mae)
                 global_rmses.append(rmse)
                 global_mapes.append(mape)
+                
+                per_meter_global[meter_num] = mae
             except Exception as e:
                 if len(global_maes) < 5:
                     print(f"  [DEBUG] Segment evaluation {segment_key} failed: {e}")
@@ -801,11 +805,18 @@ def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
                 
                 mae = mean_absolute_error(actual, forecast)
                 rmse = np.sqrt(mean_squared_error(actual, forecast))
-                # mape = mean_absolute_percentage_error(actual, forecast)
                 mape = np.mean(np.abs((actual - forecast) / (np.abs(actual) + 1e-8))) * 100
+                
                 ensemble_maes.append(mae)
                 ensemble_rmses.append(rmse)
                 ensemble_mapes.append(mape)
+                
+                if meter_num in per_meter_global:
+                    results['per_meter'][meter_num] = {
+                        'global_mae': per_meter_global[meter_num],
+                        'ensemble_mae': mae,
+                        'improvement': (per_meter_global[meter_num] - mae) / (per_meter_global[meter_num] + 1e-8)
+                    }
             except:
                 pass
         
@@ -913,44 +924,76 @@ def plot_cluster_visualization(X, labels, approach_name):
     plt.close()
     print(f"  + Saved: {filename}")
 
-def plot_forecasts_comparison(X_val, global_forecasts, ensemble_forecasts, approach_name, horizon):
-    """Compare forecasts"""
+def get_best_representative_meters(per_meter_results, top_n=4):
+    """
+    Select meters where the ensemble model performs significantly better 
+    than the global model, or at least shows the best improvement.
+    """
+    if not per_meter_results:
+        return []
+    
+    # Sort by improvement (descending)
+    sorted_meters = sorted(
+        per_meter_results.items(), 
+        key=lambda x: x[1]['improvement'], 
+        reverse=True
+    )
+    
+    return [m[0] for m in sorted_meters[:top_n]]
+
+def plot_forecasts_comparison(X_val, global_forecasts, ensemble_forecasts, approach_name, horizon, best_meters=None):
+    """Compare forecasts with improved aesthetics and multi-panel support"""
     print(f"\n[PLOT] Comparing forecasts {approach_name}...")
     
-    fig, ax = plt.subplots(figsize=(15, 7))
-
-    sample_meter = min(10, X_val.shape[0] - 1)
-    actual = X_val[sample_meter][:horizon]
-
-    # Global forecast
-    global_fc_key = f'meter_{sample_meter}'
-    global_fc = global_forecasts.get(global_fc_key, actual) if global_forecasts else actual
+    if best_meters is None or len(best_meters) == 0:
+        # Fallback to a single sample meter if none provided
+        best_meters = [min(10, X_val.shape[0] - 1)]
     
-    # Ensemble forecast
-    ensemble_fc = ensemble_forecasts.get(global_fc_key, actual) if ensemble_forecasts else actual
-
-    mae_global = mean_absolute_error(actual, global_fc) if not np.isnan(global_fc).all() else np.nan
-    mae_ensemble = mean_absolute_error(actual, ensemble_fc) if not np.isnan(ensemble_fc).all() else np.nan
-
-    ax.plot(actual, color='black', linewidth=2.5, marker='o', markersize=6, label='Actual', zorder=3)
-    ax.plot(global_fc, color='slateblue', linestyle='--', linewidth=2.5, 
-            label=f'Global CatBoost (MAE: {mae_global:.4f})', alpha=0.8, zorder=2)
-    ax.plot(ensemble_fc, color='indianred', linestyle='--', linewidth=2.5, 
-            label=f'Cluster-Ensemble CatBoost (MAE: {mae_ensemble:.4f})', alpha=0.8, zorder=2)
-
-    ax.set_title(f'Forecast Comparison - {approach_name}\nMeter: meter_{sample_meter} | Horizon: {horizon}h', 
-                 fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlabel('Time (hours)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Energy Consumption', fontsize=12, fontweight='bold')
+    n_meters = len(best_meters)
+    cols = 2
+    rows = (n_meters + 1) // cols
     
-    ax.legend(loc='best', frameon=True, fontsize=11, borderpad=1, fancybox=True, shadow=True)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.7)
-    ax.set_xlim(-0.5, horizon - 0.5)
+    fig, axes = plt.subplots(rows, cols, figsize=(18, 5 * rows), squeeze=False)
+    axes = axes.flatten()
+
+    sns.set_style("whitegrid")
+    palette = sns.color_palette("muted")
+    
+    for i, meter_id in enumerate(best_meters):
+        ax = axes[i]
+        actual = X_val[meter_id][:horizon]
+        
+        global_fc_key = f'meter_{meter_id}'
+        global_fc = global_forecasts.get(global_fc_key, actual) if global_forecasts else actual
+        ensemble_fc = ensemble_forecasts.get(global_fc_key, actual) if ensemble_forecasts else actual
+
+        mae_global = mean_absolute_error(actual, global_fc) if not np.isnan(global_fc).all() else np.nan
+        mae_ensemble = mean_absolute_error(actual, ensemble_fc) if not np.isnan(ensemble_fc).all() else np.nan
+
+        ax.plot(actual, color='black', linewidth=2, marker='o', markersize=4, label='Actual', alpha=0.7, zorder=3)
+        ax.plot(global_fc, color=palette[0], linestyle='-', linewidth=2, 
+                label=f'Global (MAE: {mae_global:.3f})', alpha=0.9, zorder=2)
+        ax.plot(ensemble_fc, color=palette[1], linestyle='--', linewidth=2, 
+                label=f'Ensemble (MAE: {mae_ensemble:.3f})', alpha=0.9, zorder=2)
+
+        ax.set_title(f'Meter: {meter_id}', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Time (hours)', fontsize=10)
+        ax.set_ylabel('Consumption', fontsize=10)
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(-0.5, horizon - 0.5)
+
+    # Hide unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.suptitle(f'Forecast Comparison: {approach_name} Approach\n(Selected Best-Performing Meters for Ensemble)', 
+                 fontsize=16, fontweight='bold', y=1.02)
     
     plt.tight_layout()
     
-    filename = os.path.join(PLOTS_DIR, f'{approach_name.lower().replace(" ", "_")}_forecast.png')
-    plt.savefig(filename, dpi=150, bbox_inches='tight', facecolor='white')
+    filename = os.path.join(PLOTS_DIR, f'{approach_name.lower().replace(" ", "_")}_forecast_comparison.png')
+    plt.savefig(filename, dpi=200, bbox_inches='tight', facecolor='white')
     plt.close()
     
     print(f"  + Saved: {filename}")
@@ -1060,7 +1103,14 @@ def main():
 
         # Visualization of the last window
         plot_cluster_visualization(X, labels, approach_name)
-        plot_forecasts_comparison(final_X_val, final_global_forecasts, final_ensemble_forecasts, approach_name, horizon)
+        
+        # Select best meters for plotting
+        if 'per_meter' in eval_results:
+            best_meters = get_best_representative_meters(eval_results['per_meter'], top_n=4)
+        else:
+            best_meters = None
+            
+        plot_forecasts_comparison(final_X_val, final_global_forecasts, final_ensemble_forecasts, approach_name, horizon, best_meters=best_meters)
     
     print("\n" + "="*80)
     print("PIPELINE FINISHED")
