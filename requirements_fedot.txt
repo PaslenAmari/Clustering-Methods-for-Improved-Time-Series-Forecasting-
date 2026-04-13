@@ -1,0 +1,2 @@
+fedot==0.7.5
+fedot_ind==0.4.2

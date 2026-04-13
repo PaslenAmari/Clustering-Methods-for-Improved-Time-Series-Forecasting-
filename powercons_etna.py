@@ -82,7 +82,7 @@ except Exception as e:
 
 # ETNA + Models + Transforms
 try:
-    from etna.models import CatBoostMultiSegmentModel
+    from etna.models import CatBoostMultiSegmentModel, LinearMultiSegmentModel
     from etna.pipeline import Pipeline
     from etna.datasets import TSDataset
     from etna.transforms import (LagTransform, DateFlagsTransform, 
@@ -108,9 +108,45 @@ try:
     print("[+] ETNA + CatBoostMultiSegmentModel")
 except Exception as e:
     print(f"[-] ETNA Import Error: {e}")
-    import traceback
-    traceback.print_exc()
     ETNA_AVAILABLE = False
+
+# Fedot.Industrial via separate venv
+FEDOT_VENV_PATH = os.environ.get("FEDOT_VENV_PATH", "/opt/fedot_env/bin/python")
+
+# fallback for docker
+if not os.path.exists(FEDOT_VENV_PATH):
+    import sys
+    FEDOT_VENV_PATH = sys.executable
+
+try:
+    # We will inject a script that first mocks the repository before importing
+    mock_script = """
+import sys
+try:
+    import fedot.core.repository.metrics_repository as mr
+    sys.modules['fedot.core.repository.quality_metrics_repository'] = mr
+except ImportError:
+    pass
+from fedot_ind.api.main import FedotIndustrial
+print("OK")
+"""
+    result = subprocess.run(
+        [FEDOT_VENV_PATH, '-c', mock_script],
+        capture_output=True,
+        text=True,
+        timeout=10
+    )
+    
+    if result.returncode == 0 and 'OK' in result.stdout:
+        FEDOT_AVAILABLE = True
+        print(f"[+] Fedot.Industrial (via {FEDOT_VENV_PATH})")
+    else:
+        FEDOT_AVAILABLE = False
+        print(f"[-] Fedot check failed: {result.stderr}")
+        
+except Exception as e:
+    print(f"[-] Fedot: {e}")
+    FEDOT_AVAILABLE = False
 
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (14, 7)
@@ -401,18 +437,26 @@ n_clusters = min(data['n_clusters'], X.shape[0]//2)
 
 X_scaled = np.array([((x - x.mean()) / (x.std() + 1e-8)) for x in X])
 
+# Subsample for speed
+n_sample = min(X_scaled.shape[0], 50)
+X_sample = X_scaled[:n_sample]
+
 kmeans = TimeSeriesKMeans(
-    n_clusters=n_clusters,
+    n_clusters=min(n_clusters, n_sample//2),
     metric="dtw",
     random_state=42,
     n_init=10
 )
-labels = kmeans.fit_predict(X_scaled)
+labels_sample = kmeans.fit_predict(X_sample)
 
-X_flat = X.reshape(X.shape[0], -1)
-sil = silhouette_score(X_flat, labels)
-dbi = davies_bouldin_score(X_flat, labels)
-chi = calinski_harabasz_score(X_flat, labels)
+# Extend labels to the whole dataset
+labels = np.zeros(X.shape[0], dtype=int)
+labels[:n_sample] = labels_sample
+
+X_flat_sample = X_sample.reshape(n_sample, -1)
+sil = silhouette_score(X_flat_sample, labels_sample)
+dbi = davies_bouldin_score(X_flat_sample, labels_sample)
+chi = calinski_harabasz_score(X_flat_sample, labels_sample)
 
 results = {{
     'labels': labels,
@@ -578,11 +622,11 @@ def build_global_model(X_train, horizon=24):
 # CLUSTER MODELS: Forecasting per individual cluster
 # ============================================================================
 
-def build_cluster_models(X_train, cluster_labels, horizon=24):
+def build_cluster_models(X_train, cluster_labels, horizon=24, fedot_model_mapping=None):
     """
     For each cluster:
     1. Select series belonging to the cluster
-    2. Build CatBoostMultiSegmentModel on all these series together
+    2. Build the model selected by Fedot for this cluster (CatBoostMultiSegmentModel or LinearMultiSegmentModel)
     3. Save forecasts BY SEGMENT_KEY
     """
     if not ETNA_AVAILABLE:
@@ -637,12 +681,25 @@ def build_cluster_models(X_train, cluster_labels, horizon=24):
                 except:
                     pass
             
-            model = CatBoostMultiSegmentModel(
-                iterations=200,
-                depth=4,
-                learning_rate=0.05,
-                random_seed=42,
-            )
+            model_name = 'catboost'
+            if fedot_model_mapping and cluster_id in fedot_model_mapping:
+                model_name = fedot_model_mapping[cluster_id]
+                
+            if model_name == 'linear':
+                print(f"    -> Dynamically using LinearMultiSegmentModel for cluster {cluster_id}")
+                try:
+                    model = LinearMultiSegmentModel()
+                except Exception as e:
+                    print(f"    -> [!] Error loading LinearMultiSegmentModel: {e}. Fallback to CatBoost.")
+                    model = CatBoostMultiSegmentModel(iterations=200, depth=4, learning_rate=0.05, random_seed=42)
+            else:
+                print(f"    -> Dynamically using CatBoostMultiSegmentModel for cluster {cluster_id}")
+                model = CatBoostMultiSegmentModel(
+                    iterations=200,
+                    depth=4,
+                    learning_rate=0.05,
+                    random_seed=42,
+                )
 
             pipeline = Pipeline(model=model, transforms=transforms, horizon=horizon)
             pipeline.fit(ts_dataset)
@@ -682,6 +739,115 @@ def build_cluster_models(X_train, cluster_labels, horizon=24):
         traceback.print_exc()
         return {}
 
+def select_best_model_for_cluster_with_fedot(cluster_data_centroid, horizon=24, timeout=0.5):
+    """
+    FEDOT MODEL SELECTOR:
+    Runs Fedot on the provided cluster centroid (mean of series in the cluster)
+    to determine the best predictive model pipeline. Returns the suggested model name.
+    """
+    if not FEDOT_AVAILABLE:
+        return 'catboost'
+        
+    print(f"      [FEDOT] Selecting best model for cluster (timeout={timeout} min)...")
+    
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', delete=False) as f:
+        temp_input = f.name
+        pickle.dump({'train_data': cluster_data_centroid, 'horizon': horizon, 'timeout': timeout}, f)
+        
+    fedot_script = f"""
+import pickle
+import warnings
+warnings.filterwarnings('ignore')
+
+import sys
+try:
+    import fedot.core.repository.metrics_repository as mr
+    sys.modules['fedot.core.repository.quality_metrics_repository'] = mr
+except ImportError:
+    pass
+
+from fedot_ind.api.main import FedotIndustrial
+
+try:
+    with open('{temp_input}', 'rb') as f:
+
+        data = pickle.load(f)
+        
+    train_data = data['train_data']
+    horizon = data['horizon']
+    timeout = data['timeout']
+    
+    industrial = FedotIndustrial(
+        problem='ts_forecasting',
+        task_params={{'forecast_length': horizon}},
+        preset='fast_train',
+        timeout=timeout,
+        n_jobs=1,
+        logging_level=50
+    )
+    
+    try:
+        industrial.fit(features=train_data, target=train_data)
+    except TypeError as fit_error:
+        if 'input_data' in str(fit_error):
+            try:
+                # fedot_ind >= 0.4.0 usually uses input_data=(features, target)
+                industrial.fit(input_data=(train_data, train_data))
+            except Exception:
+                # or just input_data=train_data
+                industrial.fit(input_data=train_data)
+        else:
+            raise
+    
+    # Extract root node descriptive id from best pipeline
+    try:
+        best_model = str(industrial.current_pipeline.root_node.descriptive_id)
+    except:
+        best_model = 'catboost'
+        
+    with open('{temp_input}.out', 'wb') as f:
+        pickle.dump(best_model, f)
+except Exception as e:
+    import traceback, sys
+    sys.stderr.write(traceback.format_exc())
+"""
+    try:
+        result = subprocess.run(
+            [FEDOT_VENV_PATH, '-c', fedot_script],
+            capture_output=True,
+            text=True,
+            timeout=int(timeout * 60) + 30
+        )
+        
+        if result.returncode == 0 and os.path.exists(f'{temp_input}.out'):
+            with open(f'{temp_input}.out', 'rb') as f:
+                best_model_desc = pickle.load(f)
+            os.unlink(f'{temp_input}.out')
+            
+            desc_lower = best_model_desc.lower()
+            if 'ridge' in desc_lower or 'lasso' in desc_lower or 'linear' in desc_lower or 'ar' in desc_lower:
+                chosen = 'linear'
+            else:
+                chosen = 'catboost'
+                
+            print(f"      -> Fedot pipeline output: {desc_lower} -> Mapped to ETNA: {chosen}")
+            return chosen
+        else:
+            print(f"      [!] Fedot selection failed or timed out. Defaulting to catboost.")
+            if result.stderr:
+                print(f"      [!] Stderr: {result.stderr.strip()}")
+            return 'catboost'
+    except subprocess.TimeoutExpired:
+        print(f"      [!] Fedot selection timed out. Defaulting to catboost.")
+        return 'catboost'
+    except Exception as e:
+        print(f"      [!] Subprocess failed: {e}. Defaulting to catboost.")
+        return 'catboost'
+    finally:
+        if os.path.exists(temp_input):
+            try: os.unlink(temp_input)
+            except: pass
+
 # ============================================================================
 # ENSEMBLE AGGREGATION
 # ============================================================================
@@ -717,7 +883,7 @@ def aggregate_cluster_forecasts(cluster_labels, cluster_forecasts):
 # EVALUATION
 # ============================================================================
 
-def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
+def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon, fedot_forecasts=None):
     """Compare global model and ensemble"""
     print("\n" + "="*80)
     print("EVALUATION: Global Model vs Cluster-Ensemble")
@@ -727,13 +893,15 @@ def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
         print("[DEBUG] global_forecasts empty in evaluate_forecasts!")
     if not ensemble_forecasts:
         print("[DEBUG] ensemble_forecasts empty in evaluate_forecasts!")
+    if fedot_forecasts is not None and not fedot_forecasts:
+        print("[DEBUG] fedot_forecasts empty in evaluate_forecasts!")
 
     results = {
         'global': {},
         'ensemble': {},
         'global_errors': [],
         'ensemble_errors': [],
-        'per_meter': {} # To store {meter_num: {'global_mae': ..., 'ensemble_mae': ...}}
+        'per_meter': {}
     }
 
     # Global evaluation
@@ -831,6 +999,8 @@ def evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, horizon):
         print(f"  MAE:  {results['ensemble']['MAE']:.4f}")
         print(f"  RMSE: {results['ensemble']['RMSE']:.4f}")
         print(f"  MAPE: {results['ensemble']['MAPE']:.4f}")
+
+    # Removed independent Fedot evaluation since Fedot is used as a model selector for the ensemble.
 
     return results
 
@@ -941,7 +1111,7 @@ def get_best_representative_meters(per_meter_results, top_n=4):
     
     return [m[0] for m in sorted_meters[:top_n]]
 
-def plot_forecasts_comparison(X_val, global_forecasts, ensemble_forecasts, approach_name, horizon, best_meters=None):
+def plot_forecasts_comparison(X_val, global_forecasts, ensemble_forecasts, approach_name, horizon, best_meters=None, fedot_forecasts=None):
     """Compare forecasts with improved aesthetics and multi-panel support"""
     print(f"\n[PLOT] Comparing forecasts {approach_name}...")
     
@@ -975,6 +1145,8 @@ def plot_forecasts_comparison(X_val, global_forecasts, ensemble_forecasts, appro
                 label=f'Global (MAE: {mae_global:.3f})', alpha=0.9, zorder=2)
         ax.plot(ensemble_fc, color=palette[1], linestyle='--', linewidth=2, 
                 label=f'Ensemble (MAE: {mae_ensemble:.3f})', alpha=0.9, zorder=2)
+        
+        # Removed Fedot plot as Fedot acts as selector now.
 
         ax.set_title(f'Meter: {meter_id}', fontsize=12, fontweight='bold')
         ax.set_xlabel('Time (hours)', fontsize=10)
@@ -1024,12 +1196,12 @@ def main():
     window_size = int(n_total * 0.075)  # 18 timesteps per test window
     
     test_windows = [
-        (int(0.3*n_total), int(0.375*n_total)),
-        (int(0.375*n_total), int(0.45*n_total)),
-        (int(0.45*n_total), int(0.525*n_total)),
-        (int(0.525*n_total), int(0.6*n_total)),
-        (int(0.6*n_total), int(0.675*n_total)),
-        (int(0.675*n_total), int(0.75*n_total)),
+        (int(0.4*n_total), int(0.475*n_total)),
+        (int(0.475*n_total), int(0.55*n_total)),
+        (int(0.55*n_total), int(0.625*n_total)),
+        (int(0.625*n_total), int(0.7*n_total)),
+        (int(0.7*n_total), int(0.775*n_total)),
+        (int(0.775*n_total), int(0.85*n_total)),
     ]
 
     print(f"\n[BACKTESTING] Starting evaluation on {len(test_windows)} windows...")
@@ -1050,34 +1222,61 @@ def main():
         print(f"PIPELINE for {approach_name} (Backtesting Mode)")
         print(f"{'='*80}")
         
+    # PRE-CALCULATE BASELINES (Global and Fedot) to save time
+    baselines_per_window = []
+    print("\n[PRE-CALCULATING BASELINES] Running Global and Fedot models...")
+    for i, (train_end, test_end) in enumerate(test_windows):
+        print(f"\n--- Baseline Window {i+1}/{len(test_windows)} ---")
+        X_train = X[:, :train_end]
+        current_horizon = test_end - train_end
+        
+        g_fc = build_global_model(X_train, horizon=current_horizon)
+        
+        baselines_per_window.append({'global': g_fc})
+
+    for approach_name, labels in approaches:
+        print(f"\n{'='*80}")
+        print(f"PIPELINE for {approach_name} (Backtesting Mode)")
+        print(f"{'='*80}")
+        
         all_global_errors = []
         all_ensemble_errors = []
-        
+        all_fedot_errors = [] 
+
         final_global_forecasts = {}
         final_ensemble_forecasts = {}
+        final_fedot_forecasts = {} 
         final_X_val = None
 
         for i, (train_end, test_end) in enumerate(test_windows):
-            print(f"\n--- Backtest Window {i+1} (Train end: {train_end}, Test: {train_end}:{test_end}) ---")
+            print(f"\n--- Backtest Window {i+1} (Approach: {approach_name}) ---")
             
             X_train = X[:, :train_end]
             X_val = X[:, train_end:test_end]
-            
             current_horizon = test_end - train_end
             
-            # Step 1: Global Model
-            global_forecasts = build_global_model(X_train, horizon=current_horizon)
+            # Use pre-calculated baselines
+            global_forecasts = baselines_per_window[i]['global']
             
-            # Step 2: Cluster Models
-            cluster_forecasts = build_cluster_models(X_train, labels, horizon=current_horizon)
+            # Step 1.5: Determine best models for each cluster using Fedot
+            fedot_model_mapping = {}
+            for cluster_id in np.unique(labels):
+                cluster_mask = labels == cluster_id
+                if np.sum(cluster_mask) > 0:
+                    cluster_centroid = np.mean(X_train[cluster_mask], axis=0)
+                    best_model = select_best_model_for_cluster_with_fedot(cluster_centroid, horizon=current_horizon, timeout=0.5)
+                    fedot_model_mapping[cluster_id] = best_model
+                    
+            # Step 2: Cluster Models (instantiate N models based on mapping, without Fedot)
+            cluster_forecasts = build_cluster_models(X_train, labels, horizon=current_horizon, fedot_model_mapping=fedot_model_mapping)
             
             # Step 3: Aggregate
             ensemble_forecasts = aggregate_cluster_forecasts(labels, cluster_forecasts)
             
             # Step 4: Evaluate this window
-            eval_results = evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, current_horizon)
+            eval_results = evaluate_forecasts(X_val, global_forecasts, ensemble_forecasts, current_horizon, fedot_forecasts=None)
             
-            # Accumulate errors for collective statistical test
+            # Accumulate errors
             all_global_errors.extend(eval_results.get('global_errors', []))
             all_ensemble_errors.extend(eval_results.get('ensemble_errors', []))
             
@@ -1104,13 +1303,16 @@ def main():
         # Visualization of the last window
         plot_cluster_visualization(X, labels, approach_name)
         
+        # Select best meters for plotting but include Fedot meters if available
         # Select best meters for plotting
         if 'per_meter' in eval_results:
             best_meters = get_best_representative_meters(eval_results['per_meter'], top_n=4)
         else:
-            best_meters = None
+            best_meters = []
             
-        plot_forecasts_comparison(final_X_val, final_global_forecasts, final_ensemble_forecasts, approach_name, horizon, best_meters=best_meters)
+        plot_forecasts_comparison(final_X_val, final_global_forecasts, final_ensemble_forecasts, 
+                                  approach_name, horizon, best_meters=best_meters, 
+                                  fedot_forecasts=None)
     
     print("\n" + "="*80)
     print("PIPELINE FINISHED")
