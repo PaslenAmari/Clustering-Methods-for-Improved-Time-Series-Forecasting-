@@ -27,20 +27,16 @@ docker-compose up --build
 The script will automatically:
 1. Download the PowerCons dataset.
 2. Run the clustering benchmarks.
-3. Perform a 6-window backtest for the forecasting models.
+3. Perform a windows backtest for the forecasting models.
 4. Save plots and metrics to the `results/` folder.
 
 ## Project Structure
 - `powercons_etna.py`: The main research pipeline.
 - `Dockerfile` & `docker-compose.yml`: Environment configuration.
 - `requirements.txt`: Python dependencies.
-- `results/`: (Generated) Contains plots and CSV metrics.
+- `results/`: Contains plots and CSV metrics.
 
 ## Key Results
 - Successfully identified **4 distinct archetypes** of energy consumers.
 - Built an end-to-end pipeline that handles multi-segment forecasting with cross-learning.
 - Established a statistical framework for model comparison.
-
-## Future Work (Semester 2)
-- Сontext-aware forecasting framework capable of handling "Drift" (sudden changes in consumer behavior).
-- Ensemble self-correction: automatic re-clustering and model retraining when drift is detected.
