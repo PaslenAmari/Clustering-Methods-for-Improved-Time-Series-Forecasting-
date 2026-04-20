@@ -40,7 +40,3 @@ The script will automatically:
 - Successfully identified **4 distinct archetypes** of energy consumers.
 - Built an end-to-end pipeline that handles multi-segment forecasting with cross-learning.
 - Established a statistical framework for model comparison.
-
-## Future Work (Semester 2)
-- Сontext-aware forecasting framework capable of handling "Drift" (sudden changes in consumer behavior).
-- Ensemble self-correction: automatic re-clustering and model retraining when drift is detected.s
