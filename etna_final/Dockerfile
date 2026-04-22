@@ -1,12 +1,12 @@
-# python:3.10-slim-bullseye вместо slim (trixie) — стабильные репозитории Debian 11
-# trixie (Debian 13 unstable) недоступен из Docker Desktop на Windows
 FROM --platform=linux/amd64 python:3.10-slim-bullseye
+
 WORKDIR /app
 
 RUN uname -m
 
 ENV PIP_DEFAULT_TIMEOUT=1000
 ENV PIP_RETRIES=10
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -28,7 +28,8 @@ RUN pip install --no-cache-dir --prefer-binary \
     scikit-learn==1.3.2 \
     scipy==1.14.1 \
     matplotlib==3.8.3 \
-    seaborn==0.13.2
+    seaborn==0.13.2 \
+    openpyxl==3.1.2
 
 RUN pip install --no-cache-dir --prefer-binary \
     prophet==1.1.5 \
@@ -45,13 +46,13 @@ RUN pip install --no-cache-dir --prefer-binary \
     pingouin==0.5.5 \
     dieboldmariano==1.1.0
 
-# ETNA 2.10.0 через tarball (PyPI на карантине, git clone падает по TLS)
 RUN pip install --no-cache-dir --prefer-binary \
     "https://github.com/etna-team/etna/archive/refs/tags/2.10.0.tar.gz#egg=etna"
 
 # ============================================================================
 # FEDOT SUB-ENVIRONMENT (/opt/fedot_env)
 # ============================================================================
+
 COPY requirements_fedot.txt .
 RUN python -m venv /opt/fedot_env && \
     /opt/fedot_env/bin/pip install --upgrade pip "setuptools<70.0.0" wheel Cython setuptools-scm && \
@@ -70,6 +71,7 @@ RUN python -m venv /opt/fedot_env && \
 # ============================================================================
 # SKTIME SUB-ENVIRONMENT (/opt/sktime_env)
 # ============================================================================
+
 COPY requirements_sktime.txt .
 RUN python -m venv /opt/sktime_env && \
     /opt/sktime_env/bin/pip install --upgrade pip "setuptools<70.0.0" wheel Cython \
@@ -77,10 +79,13 @@ RUN python -m venv /opt/sktime_env && \
     /opt/sktime_env/bin/pip install --no-cache-dir --prefer-binary --no-build-isolation \
         -r requirements_sktime.txt
 
+RUN /opt/sktime_env/bin/python -c "from sktime.clustering.k_means import TimeSeriesKMeans; print('SKTIME IS FULLY OPERATIONAL')"
+
 ENV SKTIME_VENV_PATH=/opt/sktime_env/bin/python
 ENV FEDOT_VENV_PATH=/opt/fedot_env/bin/python
 
 RUN pip install --no-cache-dir "setuptools<70.0.0"
 
 COPY . /app/
+
 CMD ["python", "powercons_etna.py"]
