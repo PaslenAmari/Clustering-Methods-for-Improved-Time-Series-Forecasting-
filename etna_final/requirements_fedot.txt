@@ -1,0 +1,5 @@
+# requirements_fedot.txt
+# Plain Fedot AutoML (fedot_ind/FedotIndustrial удалён — конфликт зависимостей)
+# Устанавливается в отдельный venv: /opt/fedot_env
+# Python 3.10+, совместимо с numpy 1.24–1.26
+fedot==0.7.5

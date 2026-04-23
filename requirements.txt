@@ -14,3 +14,4 @@ numba==0.60.0
 llvmlite==0.43.0
 requests==2.31.0
 catboost==1.2.3
+setuptools==69.5.1
