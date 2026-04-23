@@ -1,0 +1,2 @@
+# requirements_fedot.txt
+fedot==0.7.5
