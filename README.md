@@ -56,6 +56,7 @@ The script will automatically:
 - `powercons_etna.py`: The main execution pipeline containing data processing, clustering, and forecasting logic.
 - `Dockerfile` & `docker-compose.yml`: Containerization and environment configuration.
 - `requirements.txt`: Strict Python dependencies.
+- `requirements_sktime.txt`: sktime requirements
 - `results/`: Output directory for generated visualizations and performance metrics.
 
 ## Key Results
