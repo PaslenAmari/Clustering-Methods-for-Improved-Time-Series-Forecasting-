@@ -1,4 +1,4 @@
-Cluster-Ensemble Time Series Forecasting for Global Electricity Load
+# Cluster-Ensemble Time Series Forecasting for Global Electricity Load
 ## Project Overview
 
 This repository contains the research codebase for evaluating a cluster-ensemble approach to time series forecasting, applied to highly heterogeneous global energy data. Instead of training a single monolithic model for all regions or isolated models for each specific region, this project implements an intermediate ensemble strategy:
